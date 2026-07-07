@@ -205,19 +205,27 @@ def send_code_sms(destination: str, code: str, purpose: str, username: str) -> t
     sid = get_first_secret_value(["TWILIO_ACCOUNT_SID", "TWILIO_SID"])
     token = get_first_secret_value(["TWILIO_AUTH_TOKEN", "TWILIO_TOKEN"])
     from_number = get_first_secret_value(["TWILIO_FROM_NUMBER", "TWILIO_FROM", "TWILIO_PHONE_NUMBER"])
+    messaging_service_sid = get_first_secret_value(["TWILIO_MESSAGING_SERVICE_SID", "TWILIO_MSG_SERVICE_SID"])
 
-    if not sid or not token or not from_number:
+    if not sid or not token or (not from_number and not messaging_service_sid):
         return (
             False,
-            "SMS delivery not configured. Set: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER.",
+            "SMS delivery not configured. Set: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and either "
+            "TWILIO_FROM_NUMBER or TWILIO_MESSAGING_SERVICE_SID.",
         )
 
     msg = f"{username}, your {purpose} verification code is {code}. It expires in 10 minutes."
     url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
     try:
+        payload = {"To": destination, "Body": msg}
+        if messaging_service_sid:
+            payload["MessagingServiceSid"] = messaging_service_sid
+        else:
+            payload["From"] = from_number
+
         response = requests.post(
             url,
-            data={"To": destination, "From": from_number, "Body": msg},
+            data=payload,
             auth=(sid, token),
             timeout=10,
         )
@@ -233,7 +241,19 @@ def deliver_verification_code(method: str, destination: str, code: str, purpose:
     if normalized_method == "email":
         return send_code_email(destination, code, purpose, username)
     if normalized_method == "phone":
-        return send_code_sms(destination, code, purpose, username)
+        sms_ok, sms_note = send_code_sms(destination, code, purpose, username)
+        if sms_ok:
+            return sms_ok, sms_note
+
+        account = st.session_state.accounts.get(username, {})
+        fallback_email = str(account.get("email", "")).strip()
+        if fallback_email:
+            email_ok, email_note = send_code_email(fallback_email, code, purpose, username)
+            if email_ok:
+                return True, "SMS unavailable; verification code was sent to the linked email instead."
+            return False, f"SMS failed and email fallback failed: {email_note}"
+
+        return False, sms_note
     return False, "Unsupported verification method."
 
 
