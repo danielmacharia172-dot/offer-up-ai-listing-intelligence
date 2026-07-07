@@ -69,6 +69,59 @@ def build_verification_code() -> str:
     return f"{secrets.randbelow(900000) + 100000}"
 
 
+def verification_key(username: str, purpose: str, method: str) -> str:
+    return f"{username.strip().lower()}|{purpose.strip().lower()}|{method.strip().lower()}"
+
+
+def get_verification_record(username: str, purpose: str, method: str) -> dict[str, Any] | None:
+    key = verification_key(username, purpose, method)
+    record = st.session_state.pending_verifications.get(key)
+    return record if isinstance(record, dict) else None
+
+
+def issue_verification_code(
+    username: str,
+    purpose: str,
+    method: str,
+    destination: str,
+    new_password_hash: str = "",
+) -> dict[str, Any]:
+    code = build_verification_code()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    record = {
+        "username": username.strip(),
+        "purpose": purpose,
+        "method": method,
+        "value": destination.strip(),
+        "code": code,
+        "new_password_hash": new_password_hash,
+        "issued_at": now_ts,
+        "expires_at": now_ts + 600,
+    }
+    st.session_state.pending_verifications[verification_key(username, purpose, method)] = record
+    return record
+
+
+def verification_seconds_left(record: dict[str, Any] | None) -> int:
+    if not record:
+        return 0
+    return max(0, int(float(record.get("expires_at", 0)) - datetime.now(timezone.utc).timestamp()))
+
+
+def format_countdown(seconds_left: int) -> str:
+    mins, secs = divmod(max(0, seconds_left), 60)
+    return f"{mins:02d}:{secs:02d}"
+
+
+def remove_verification_record(username: str, purpose: str, method: str) -> None:
+    st.session_state.pending_verifications.pop(verification_key(username, purpose, method), None)
+
+
+def maybe_show_demo_code(code: str) -> None:
+    if get_secret_value("DEMO_SHOW_VERIFICATION_CODES").lower() == "true":
+        st.info(f"Demo only - verification code: {code}")
+
+
 def ensure_default_account(expected_username: str, expected_password: str) -> None:
     accounts = st.session_state.accounts
     if expected_username not in accounts:
@@ -171,6 +224,9 @@ def init_state() -> None:
     defaults = {
         "authenticated": False,
         "current_user": "",
+        "active_panel": "profile",
+        "active_role": "Lister",
+        "user_roles": {},
         "pending_login_user": "",
         "needs_upload_resume_choice": False,
         "accounts": {},
@@ -191,6 +247,7 @@ def init_state() -> None:
         "password_overrides": {},
         "messages": [],
         "detected_location": "",
+        "location_confirmed_by_user": False,
         "listing_drafts": {},
         "active_listing_draft": {
             "title": "",
@@ -548,21 +605,43 @@ def generate_ai_suggestion_with_optional_vision(
 
 
 def suggest_location_from_ip(client_id: str) -> str:
-    if not client_id or client_id == "local":
+    ip_to_use = client_id
+
+    if not ip_to_use or ip_to_use == "local" or ip_to_use.startswith("127."):
+        try:
+            ip_resp = requests.get("https://api.ipify.org?format=json", timeout=4)
+            if ip_resp.status_code == 200:
+                ip_to_use = str(ip_resp.json().get("ip", "")).strip()
+        except Exception:
+            ip_to_use = ""
+
+    if not ip_to_use:
         return ""
 
-    try:
-        response = requests.get(f"https://ipapi.co/{client_id}/json/", timeout=4)
-        if response.status_code != 200:
-            return ""
-        payload = response.json()
-        city = str(payload.get("city", "")).strip()
-        region = str(payload.get("region", "")).strip()
-        country = str(payload.get("country_name", "")).strip()
-        parts = [part for part in [city, region, country] if part]
-        return ", ".join(parts)
-    except Exception:
-        return ""
+    providers = [
+        f"https://ipapi.co/{ip_to_use}/json/",
+        f"https://ipwho.is/{ip_to_use}",
+        f"https://www.geoplugin.net/json.gp?ip={ip_to_use}",
+    ]
+
+    for url in providers:
+        try:
+            response = requests.get(url, timeout=4)
+            if response.status_code != 200:
+                continue
+            payload = response.json()
+
+            city = str(payload.get("city") or payload.get("geoplugin_city") or "").strip()
+            region = str(payload.get("region") or payload.get("region_name") or payload.get("geoplugin_region") or "").strip()
+            country = str(payload.get("country_name") or payload.get("country") or payload.get("geoplugin_countryName") or "").strip()
+
+            parts = [part for part in [city, region, country] if part]
+            if parts:
+                return ", ".join(parts)
+        except Exception:
+            continue
+
+    return ""
 
 
 def render_reviews_section(logger: Any, client_id: str) -> None:
@@ -725,18 +804,28 @@ def render_listing_field_highlights(errors: dict[str, str]) -> None:
         st.markdown(f"<style>{''.join(css_rules)}</style>", unsafe_allow_html=True)
 
 
-def render_account_security_panel(logger: Any) -> None:
-    st.sidebar.header("Account and Security")
-    st.sidebar.write(f"Signed in as: **{st.session_state.current_user}**")
-    st.sidebar.caption("Privacy mode keeps sensitive personal details out of external AI prompts.")
+def render_profile_panel(logger: Any) -> None:
+    st.markdown("### Profile")
+    st.write(f"Username: **{st.session_state.current_user}**")
+    st.caption("Privacy mode keeps sensitive personal details out of external AI prompts.")
+
+    current_role = st.session_state.user_roles.get(st.session_state.current_user, st.session_state.active_role)
+    st.write(f"Current role: **{current_role}**")
+    role_choice = st.selectbox("Switch role", ["Lister", "Buyer"], index=0 if current_role == "Lister" else 1, key="profile_role_switch")
+    if st.button("Apply role", key="apply_profile_role"):
+        st.session_state.active_role = role_choice
+        st.session_state.user_roles[st.session_state.current_user] = role_choice
+        st.success(f"Role switched to {role_choice}.")
+        st.rerun()
 
     profiles = st.session_state.account_profiles
     profile = profiles.get(st.session_state.current_user, {"email": "", "phone": ""})
+    account = st.session_state.accounts.get(st.session_state.current_user, {})
 
-    with st.sidebar.form("link_contact_form"):
+    with st.form("profile_contact_form"):
         email = st.text_input("Linked email", value=profile.get("email", ""), placeholder="name@example.com")
         phone = st.text_input("Linked phone", value=profile.get("phone", ""), placeholder="+1 555 123 4567")
-        save_contact = st.form_submit_button("Save recovery contacts")
+        save_contact = st.form_submit_button("Save and send verification code")
 
     if save_contact:
         clean_email = email.strip()
@@ -745,10 +834,62 @@ def render_account_security_panel(logger: Any) -> None:
         if st.session_state.current_user in st.session_state.accounts:
             st.session_state.accounts[st.session_state.current_user]["email"] = clean_email
             st.session_state.accounts[st.session_state.current_user]["phone"] = clean_phone
-        emit_audit_event(logger, "backup_contact_updated", {"user": st.session_state.current_user})
-        st.sidebar.success("Recovery contacts saved.")
+            st.session_state.accounts[st.session_state.current_user]["verified_email"] = False if clean_email else False
+            st.session_state.accounts[st.session_state.current_user]["verified_phone"] = False if clean_phone else False
 
-    with st.sidebar.form("change_password_form"):
+        if clean_email:
+            rec = issue_verification_code(st.session_state.current_user, "contact_verify", "email", clean_email)
+            maybe_show_demo_code(str(rec["code"]))
+        if clean_phone:
+            rec = issue_verification_code(st.session_state.current_user, "contact_verify", "phone", clean_phone)
+            maybe_show_demo_code(str(rec["code"]))
+
+        emit_audit_event(logger, "backup_contact_updated", {"user": st.session_state.current_user})
+        st.success("Contact saved and a private verification code was sent.")
+
+    st.markdown("#### Verify linked contact")
+    verify_method = st.selectbox("Contact method", ["Email", "Phone"], key="profile_verify_method")
+    method_key = verify_method.lower()
+    active_destination = str(account.get("email", "")) if method_key == "email" else str(account.get("phone", ""))
+    active_record = get_verification_record(st.session_state.current_user, "contact_verify", method_key)
+    time_left = verification_seconds_left(active_record)
+
+    if active_record and time_left > 0:
+        st.caption(f"Code expires in: {format_countdown(time_left)}")
+    elif active_record and time_left == 0:
+        st.warning("Code expired. Request a new one.")
+
+    col_verify_1, col_verify_2 = st.columns(2)
+    with col_verify_1:
+        verify_input = st.text_input("Enter verification code", key="profile_contact_verify_code")
+        if st.button("Verify contact", key="profile_verify_contact_btn"):
+            if not active_destination:
+                st.error("No linked destination found for this method.")
+            elif not active_record:
+                st.error("No verification request found. Use resend code.")
+            elif verification_seconds_left(active_record) == 0:
+                st.error("Code expired. Use resend code.")
+            elif verify_input.strip() != str(active_record.get("code", "")):
+                st.error("Invalid verification code.")
+            else:
+                if st.session_state.current_user in st.session_state.accounts:
+                    verified_key = "verified_email" if method_key == "email" else "verified_phone"
+                    st.session_state.accounts[st.session_state.current_user][verified_key] = True
+                remove_verification_record(st.session_state.current_user, "contact_verify", method_key)
+                emit_audit_event(logger, "contact_verified", {"user": st.session_state.current_user, "method": method_key})
+                st.success("Contact verified successfully.")
+
+    with col_verify_2:
+        if st.button("Resend code", key="profile_resend_contact_code"):
+            if not active_destination:
+                st.error("No linked destination found for this method.")
+            else:
+                rec = issue_verification_code(st.session_state.current_user, "contact_verify", method_key, active_destination)
+                maybe_show_demo_code(str(rec["code"]))
+                st.success("A new verification code was sent. It is valid for 10 minutes.")
+
+    st.markdown("#### Change password")
+    with st.form("change_password_form"):
         current_password = st.text_input("Current password", type="password")
         new_password = st.text_input("New password", type="password")
         confirm_password = st.text_input("Confirm new password", type="password")
@@ -757,19 +898,19 @@ def render_account_security_panel(logger: Any) -> None:
     if do_change:
         account = st.session_state.accounts.get(st.session_state.current_user)
         if not account:
-            st.sidebar.error("Account profile not found.")
+            st.error("Account profile not found.")
         elif not verify_password(current_password, str(account.get("password_hash", ""))):
-            st.sidebar.error("Current password is incorrect.")
+            st.error("Current password is incorrect.")
         elif len(new_password.strip()) < 8:
-            st.sidebar.error("New password must be at least 8 characters.")
+            st.error("New password must be at least 8 characters.")
         elif new_password != confirm_password:
-            st.sidebar.error("New password and confirmation do not match.")
+            st.error("New password and confirmation do not match.")
         else:
             st.session_state.accounts[st.session_state.current_user]["password_hash"] = hash_password(new_password.strip())
             emit_audit_event(logger, "password_changed", {"user": st.session_state.current_user})
-            st.sidebar.success("Password changed.")
+            st.success("Password changed.")
 
-    if st.sidebar.button("Log out", use_container_width=True):
+    if st.button("Log out", key="profile_logout", use_container_width=True):
         if st.session_state.current_user:
             save_listing_draft_for_user(st.session_state.current_user, st.session_state.active_listing_draft)
         st.session_state.authenticated = False
@@ -846,6 +987,7 @@ def main() -> None:
     bootstrap_password = get_effective_password(expected_username, expected_password)
     ensure_default_account(expected_username, bootstrap_password)
     st.session_state.account_profiles.setdefault(expected_username, {"email": "", "phone": ""})
+    st.session_state.user_roles.setdefault(expected_username, "Lister")
 
     try:
         pre_auth_client_id = get_client_identity(getattr(st.context, "headers", {}))
@@ -871,6 +1013,8 @@ def main() -> None:
                     st.session_state.current_user = username.strip()
                     st.session_state.pending_login_user = username.strip()
                     st.session_state.needs_upload_resume_choice = True
+                    st.session_state.active_role = st.session_state.user_roles.get(username.strip(), "Lister")
+                    st.session_state.active_panel = "profile"
                     load_user_listing_draft(username.strip())
 
                     if remember_credentials:
@@ -919,46 +1063,67 @@ def main() -> None:
                     phone = clean_contact if verify_method == "Phone" else ""
                     create_account(clean_username, new_password.strip(), email=email, phone=phone)
                     st.session_state.account_profiles[clean_username] = {"email": email, "phone": phone}
+                    st.session_state.user_roles[clean_username] = "Lister"
 
-                    code = build_verification_code()
-                    st.session_state.pending_verifications[clean_username] = {
-                        "purpose": "create_account",
-                        "method": verify_method.lower(),
-                        "value": clean_contact,
-                        "code": code,
-                        "expires_at": (datetime.now(timezone.utc).timestamp() + 600),
-                    }
+                    rec = issue_verification_code(
+                        clean_username,
+                        "create_account",
+                        verify_method.lower(),
+                        clean_contact,
+                    )
                     emit_audit_event(logger, "account_created", {"user": clean_username, "method": verify_method.lower()})
                     st.success("Account created. Enter your verification code below to activate login.")
-
-                    if get_secret_value("DEMO_SHOW_VERIFICATION_CODES").lower() != "false":
-                        st.info(f"Demo verification code for {clean_username}: {code}")
+                    maybe_show_demo_code(str(rec["code"]))
 
             with st.form("verify_new_account_form"):
                 verify_username = st.text_input("Username to verify")
+                verify_method_check = st.selectbox("Verification method used", ["Email", "Phone"], key="verify_new_method")
                 verify_code = st.text_input("Verification code")
                 verify_submit = st.form_submit_button("Verify account")
 
             if verify_submit:
-                pending = st.session_state.pending_verifications.get(verify_username.strip())
+                pending = get_verification_record(verify_username.strip(), "create_account", verify_method_check.lower())
                 account = st.session_state.accounts.get(verify_username.strip())
 
-                if not pending or pending.get("purpose") != "create_account":
+                if not pending:
                     st.error("No account verification is pending for this username.")
-                elif datetime.now(timezone.utc).timestamp() > float(pending.get("expires_at", 0)):
-                    st.error("Verification code expired. Create account again to generate a new code.")
+                elif verification_seconds_left(pending) == 0:
+                    st.error("Verification code expired. Use resend code to generate a new one.")
                 elif str(verify_code).strip() != str(pending.get("code", "")):
                     st.error("Invalid verification code.")
                 elif not account:
                     st.error("Account not found.")
                 else:
-                    if pending.get("method") == "email":
+                    if verify_method_check.lower() == "email":
                         account["verified_email"] = True
                     else:
                         account["verified_phone"] = True
-                    st.session_state.pending_verifications.pop(verify_username.strip(), None)
+                    remove_verification_record(verify_username.strip(), "create_account", verify_method_check.lower())
                     emit_audit_event(logger, "account_verified", {"user": verify_username.strip()})
                     st.success("Account verified. You can now log in.")
+
+            resend_create_user = st.text_input("Resend code username", key="resend_create_username")
+            resend_create_method = st.selectbox("Resend method", ["Email", "Phone"], key="resend_create_method")
+            existing_create = get_verification_record(resend_create_user.strip(), "create_account", resend_create_method.lower())
+            if existing_create:
+                st.caption(f"Create-account code expires in: {format_countdown(verification_seconds_left(existing_create))}")
+            if st.button("Resend create-account code", key="resend_create_code"):
+                account = st.session_state.accounts.get(resend_create_user.strip())
+                if not account:
+                    st.error("Account not found.")
+                else:
+                    destination = str(account.get("email", "")) if resend_create_method == "Email" else str(account.get("phone", ""))
+                    if not destination:
+                        st.error("No linked destination for this method.")
+                    else:
+                        rec = issue_verification_code(
+                            resend_create_user.strip(),
+                            "create_account",
+                            resend_create_method.lower(),
+                            destination,
+                        )
+                        maybe_show_demo_code(str(rec["code"]))
+                        st.success("A new code was sent. It is valid for 10 minutes.")
 
         with st.expander("Forgot password?"):
             with st.form("forgot_password_request_form"):
@@ -986,36 +1151,34 @@ def main() -> None:
                 elif recovery_new_password != recovery_confirm_password:
                     st.error("New password and confirmation do not match.")
                 else:
-                    code = build_verification_code()
-                    st.session_state.pending_verifications[recover_username.strip()] = {
-                        "purpose": "reset_password",
-                        "method": recovery_method.lower(),
-                        "value": recovery_value.strip(),
-                        "code": code,
-                        "new_password_hash": hash_password(recovery_new_password.strip()),
-                        "expires_at": (datetime.now(timezone.utc).timestamp() + 600),
-                    }
+                    rec = issue_verification_code(
+                        recover_username.strip(),
+                        "reset_password",
+                        recovery_method.lower(),
+                        recovery_value.strip(),
+                        new_password_hash=hash_password(recovery_new_password.strip()),
+                    )
                     emit_audit_event(
                         logger,
                         "password_reset_requested",
                         {"user": recover_username.strip(), "method": recovery_method.lower()},
                     )
                     st.success("Recovery code generated. Enter it below to complete password reset.")
-                    if get_secret_value("DEMO_SHOW_VERIFICATION_CODES").lower() != "false":
-                        st.info(f"Demo recovery code for {recover_username.strip()}: {code}")
+                    maybe_show_demo_code(str(rec["code"]))
 
             with st.form("forgot_password_verify_form"):
                 verify_reset_username = st.text_input("Username for reset verification")
+                verify_reset_method = st.selectbox("Recovery method used", ["Email", "Phone"], key="reset_verify_method")
                 verify_reset_code = st.text_input("Reset verification code")
                 verify_reset_submit = st.form_submit_button("Verify and reset password")
 
             if verify_reset_submit:
-                pending = st.session_state.pending_verifications.get(verify_reset_username.strip())
+                pending = get_verification_record(verify_reset_username.strip(), "reset_password", verify_reset_method.lower())
                 account = st.session_state.accounts.get(verify_reset_username.strip())
 
-                if not pending or pending.get("purpose") != "reset_password":
+                if not pending:
                     st.error("No password reset is pending for this username.")
-                elif datetime.now(timezone.utc).timestamp() > float(pending.get("expires_at", 0)):
+                elif verification_seconds_left(pending) == 0:
                     st.error("Recovery code expired. Request a new one.")
                 elif str(verify_reset_code).strip() != str(pending.get("code", "")):
                     st.error("Invalid recovery code.")
@@ -1023,9 +1186,36 @@ def main() -> None:
                     st.error("Account not found.")
                 else:
                     account["password_hash"] = str(pending.get("new_password_hash", account.get("password_hash", "")))
-                    st.session_state.pending_verifications.pop(verify_reset_username.strip(), None)
+                    remove_verification_record(verify_reset_username.strip(), "reset_password", verify_reset_method.lower())
                     emit_audit_event(logger, "password_reset", {"user": verify_reset_username.strip()})
                     st.success("Password reset successful. Use your new password to log in.")
+
+            resend_reset_user = st.text_input("Resend recovery code username", key="resend_reset_username")
+            resend_reset_method = st.selectbox("Resend recovery method", ["Email", "Phone"], key="resend_reset_method")
+            existing_reset = get_verification_record(resend_reset_user.strip(), "reset_password", resend_reset_method.lower())
+            if existing_reset:
+                st.caption(f"Recovery code expires in: {format_countdown(verification_seconds_left(existing_reset))}")
+            if st.button("Resend recovery code", key="resend_recovery_code"):
+                existing = get_verification_record(resend_reset_user.strip(), "reset_password", resend_reset_method.lower())
+                account = st.session_state.accounts.get(resend_reset_user.strip())
+                if not account:
+                    st.error("Account not found.")
+                elif not existing:
+                    st.error("No pending recovery request found. Request a code first.")
+                else:
+                    destination = str(account.get("email", "")) if resend_reset_method == "Email" else str(account.get("phone", ""))
+                    if not destination:
+                        st.error("No linked destination for this method.")
+                    else:
+                        rec = issue_verification_code(
+                            resend_reset_user.strip(),
+                            "reset_password",
+                            resend_reset_method.lower(),
+                            destination,
+                            new_password_hash=str(existing.get("new_password_hash", "")),
+                        )
+                        maybe_show_demo_code(str(rec["code"]))
+                        st.success("A new recovery code was sent. It is valid for 10 minutes.")
         st.stop()
 
     try:
@@ -1039,10 +1229,31 @@ def main() -> None:
         st.error(f"Request setup failed unexpectedly: {exc}")
         st.stop()
 
-    render_account_security_panel(logger=logger)
-    render_update_assistant_panel(logger=logger)
+    if st.session_state.current_user not in st.session_state.user_roles:
+        st.session_state.user_roles[st.session_state.current_user] = "Lister"
+    st.session_state.active_role = st.session_state.user_roles.get(st.session_state.current_user, "Lister")
 
-    role = st.radio("Select your role", ["Lister", "Buyer"], horizontal=True)
+    nav_left, nav_center, nav_right = st.columns([1, 6, 1])
+    with nav_left:
+        if st.button("👤", key="nav_profile_icon", help="Profile", use_container_width=True):
+            st.session_state.active_panel = "profile"
+    with nav_center:
+        st.caption(
+            f"Signed in as {st.session_state.current_user} | Active role: {st.session_state.active_role}"
+        )
+    with nav_right:
+        if st.button("💬", key="nav_messages_icon", help="Messages", use_container_width=True):
+            st.session_state.active_panel = "messages"
+
+    if st.session_state.active_panel == "profile":
+        render_profile_panel(logger=logger)
+    elif st.session_state.active_panel == "messages":
+        render_messages_panel(logger=logger, current_user=st.session_state.current_user)
+
+    if st.session_state.current_user == expected_username:
+        render_update_assistant_panel(logger=logger)
+
+    role = st.session_state.active_role
 
     if role == "Buyer":
         listings = st.session_state.analyzed_listings
@@ -1102,16 +1313,21 @@ def main() -> None:
     else:
         st.caption("AI vision model is not configured. Using heuristic photo analysis.")
 
-    use_location_detect = st.checkbox("Allow location suggestion from my connection (permission-based)")
+    use_location_detect = st.checkbox(
+        "Allow location suggestion from my connection (permission-based)",
+        key="allow_location_suggest",
+    )
     if st.button("Suggest my current location", disabled=not use_location_detect):
         detected = suggest_location_from_ip(client_id)
         if detected:
             st.session_state.detected_location = detected
+            st.session_state.location_confirmed_by_user = True
             st.success(f"Suggested location: {detected}")
         else:
+            st.session_state.location_confirmed_by_user = False
             st.warning("Could not determine your location automatically. Enter location manually.")
 
-    default_location = st.session_state.detected_location if st.session_state.detected_location else "Austin, TX"
+    default_location = st.session_state.detected_location if st.session_state.location_confirmed_by_user else ""
 
     if st.session_state.needs_upload_resume_choice and st.session_state.pending_login_user == st.session_state.current_user:
         existing_draft = st.session_state.listing_drafts.get(st.session_state.current_user, get_default_listing_draft(default_location))
@@ -1155,7 +1371,7 @@ def main() -> None:
         st.session_state.pending_login_user = ""
 
     active_draft = st.session_state.active_listing_draft
-    if not str(active_draft.get("location", "")).strip():
+    if st.session_state.location_confirmed_by_user and not str(active_draft.get("location", "")).strip():
         active_draft["location"] = default_location
 
     st.markdown("### Upload draft")
@@ -1351,7 +1567,6 @@ def main() -> None:
                             f"{insight['megapixels']} MP | {insight['file_size_kb']} KB"
                         )
 
-    render_messages_panel(logger=logger, current_user=st.session_state.current_user)
     render_reviews_section(logger=logger, client_id=client_id)
 
 
