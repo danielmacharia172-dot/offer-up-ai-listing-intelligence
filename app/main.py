@@ -106,6 +106,22 @@ def get_vision_runtime_config() -> dict[str, Any]:
     }
 
 
+def get_vision_diagnostics() -> dict[str, Any]:
+    provider_hint = (get_secret_value("VISION_PROVIDER") or get_secret_value("AI_VISION_PROVIDER")).strip().lower()
+    config = get_vision_runtime_config()
+    return {
+        "provider": str(config.get("provider", "local")),
+        "external_enabled": bool(config.get("external_enabled", False)),
+        "model": str(config.get("model", "")),
+        "base_url": str(config.get("base_url", "")),
+        "has_vision_api_key": bool(get_secret_value("VISION_API_KEY")),
+        "has_openai_api_key": bool(get_secret_value("OPENAI_API_KEY")),
+        "has_openrouter_api_key": bool(get_secret_value("OPENROUTER_API_KEY")),
+        "has_explicit_provider_setting": bool(provider_hint),
+        "resolved_from": "external" if bool(config.get("external_enabled", False)) else "local-fallback",
+    }
+
+
 def ensure_account_programs(username: str) -> None:
     programs = st.session_state.account_programs
     profile = programs.setdefault(
@@ -1293,6 +1309,23 @@ def render_profile_panel(logger: Any) -> None:
                     refresh_program_badges_and_growth(st.session_state.current_user)
                     emit_audit_event(logger, "transaction_outcome_saved", {"user": st.session_state.current_user, "transaction_id": selected_tx_id})
                     st.success("Transaction outcome saved.")
+
+    with st.expander("Vision diagnostics"):
+        diag = get_vision_diagnostics()
+        st.caption("Configuration checks only. Secret values are never shown.")
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Provider", str(diag.get("provider", "local")))
+        d2.metric("Mode", "External" if bool(diag.get("external_enabled", False)) else "Local fallback")
+        d3.metric("Resolved from", str(diag.get("resolved_from", "local-fallback")))
+
+        st.write(f"Model: **{diag.get('model', '')}**")
+        st.write(f"Base URL: **{diag.get('base_url', '')}**")
+        st.write(f"VISION_API_KEY detected: **{'Yes' if diag.get('has_vision_api_key') else 'No'}**")
+        st.write(f"OPENAI_API_KEY detected: **{'Yes' if diag.get('has_openai_api_key') else 'No'}**")
+        st.write(f"OPENROUTER_API_KEY detected: **{'Yes' if diag.get('has_openrouter_api_key') else 'No'}**")
+        st.write(
+            f"Explicit provider setting detected: **{'Yes' if diag.get('has_explicit_provider_setting') else 'No'}**"
+        )
 
     profiles = st.session_state.account_profiles
     profile = profiles.get(st.session_state.current_user, {"email": "", "phone": ""})
