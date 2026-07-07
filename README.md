@@ -9,6 +9,10 @@ This project provides a Streamlit-based experience for evaluating marketplace li
 - Multi-photo listing upload with image gallery + basic image insights
 - Built-in buyer review platform with per-listing 1-5 star ratings
 - Review sorting and minimum-rating filtering controls
+- Multi-user account creation and login with contact verification
+- Remember username/password option per device session
+- Privacy-aware AI prompt redaction for email/phone content
+- AI update assistant that checks for updates and requires approval before update action
 
 ## Run locally
 
@@ -32,6 +36,10 @@ Set the following environment variables before launching the app:
 export APP_USERNAME=admin
 export APP_PASSWORD=change-me
 export APP_AUDIT_LOG_PATH=./app_audit.log
+export APP_AUTH_SALT=change-this-auth-salt
+export DEMO_SHOW_VERIFICATION_CODES=true
+export APP_GITHUB_REPO=danielmacharia172-dot/Online-market-listing-intelligence
+export APP_BUILD_COMMIT=unknown
 ```
 
 Optional AI vision analysis (for real model-based photo understanding):
@@ -63,6 +71,10 @@ For Streamlit Cloud, the app entry point is [streamlit_app.py](streamlit_app.py)
 APP_USERNAME="admin"
 APP_PASSWORD="change-me"
 APP_AUDIT_LOG_PATH="./app_audit.log"
+APP_AUTH_SALT="change-this-auth-salt"
+DEMO_SHOW_VERIFICATION_CODES="true"
+APP_GITHUB_REPO="danielmacharia172-dot/Online-market-listing-intelligence"
+APP_BUILD_COMMIT="unknown"
 OPENAI_API_KEY="your_api_key"
 OPENAI_MODEL="gpt-4o-mini"
 OPENAI_BASE_URL="https://api.openai.com/v1"

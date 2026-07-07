@@ -1,7 +1,9 @@
 import base64
+import hashlib
 import json
 import os
 import re
+import secrets
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,7 +22,6 @@ from app.security import (
     MAX_PRICE,
     MAX_TITLE_LENGTH,
     RateLimiter,
-    authenticate_user,
     get_auth_credentials,
     get_client_identity,
     validate_listing_input,
@@ -39,12 +40,149 @@ def get_secret_value(name: str) -> str:
         return ""
 
 
+APP_VERSION = "2026.07.07"
+
+
+def hash_password(password: str) -> str:
+    salt = get_secret_value("APP_AUTH_SALT") or "local-dev-salt"
+    return hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+
+
+def verify_password(password: str, expected_hash: str) -> bool:
+    return bool(password) and hash_password(password) == expected_hash
+
+
+def is_contact_verified(account: dict[str, Any]) -> bool:
+    return bool(account.get("verified_email") or account.get("verified_phone"))
+
+
+def redact_sensitive_text(value: str) -> str:
+    if not value:
+        return value
+
+    text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[redacted-email]", value)
+    text = re.sub(r"\+?\d[\d\s().-]{7,}\d", "[redacted-phone]", text)
+    return text
+
+
+def build_verification_code() -> str:
+    return f"{secrets.randbelow(900000) + 100000}"
+
+
+def ensure_default_account(expected_username: str, expected_password: str) -> None:
+    accounts = st.session_state.accounts
+    if expected_username not in accounts:
+        accounts[expected_username] = {
+            "password_hash": hash_password(expected_password),
+            "email": "",
+            "phone": "",
+            "verified_email": True,
+            "verified_phone": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def account_exists(username: str) -> bool:
+    return username in st.session_state.accounts
+
+
+def authenticate_account(username: str, password: str) -> bool:
+    account = st.session_state.accounts.get(username)
+    if not account:
+        return False
+
+    if not verify_password(password, str(account.get("password_hash", ""))):
+        return False
+
+    return is_contact_verified(account)
+
+
+def create_account(username: str, password: str, email: str, phone: str) -> None:
+    st.session_state.accounts[username] = {
+        "password_hash": hash_password(password),
+        "email": email,
+        "phone": phone,
+        "verified_email": False,
+        "verified_phone": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def save_remembered_credentials(client_id: str, username: str, password: str) -> None:
+    st.session_state.remembered_credentials_by_client[client_id] = {
+        "username": username,
+        "password": password,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def clear_remembered_credentials(client_id: str) -> None:
+    if client_id in st.session_state.remembered_credentials_by_client:
+        del st.session_state.remembered_credentials_by_client[client_id]
+
+
+def get_remembered_credentials(client_id: str) -> dict[str, str]:
+    remembered = st.session_state.remembered_credentials_by_client.get(client_id, {})
+    return {
+        "username": str(remembered.get("username", "")),
+        "password": str(remembered.get("password", "")),
+    }
+
+
+def check_for_available_update() -> dict[str, Any]:
+    repo = get_secret_value("APP_GITHUB_REPO") or "danielmacharia172-dot/Online-market-listing-intelligence"
+    deployed_commit = get_secret_value("APP_BUILD_COMMIT") or "unknown"
+
+    result: dict[str, Any] = {
+        "status": "unknown",
+        "message": "Update check not run yet.",
+        "latest_commit": "",
+        "deployed_commit": deployed_commit,
+        "update_needed": False,
+    }
+
+    try:
+        response = requests.get(f"https://api.github.com/repos/{repo}/commits/main", timeout=10)
+        if response.status_code >= 400:
+            result["status"] = "error"
+            result["message"] = "Could not check GitHub for updates."
+            return result
+
+        payload = response.json()
+        latest_commit = str(payload.get("sha", ""))[:12]
+        result["latest_commit"] = latest_commit
+
+        if deployed_commit != "unknown" and latest_commit and latest_commit != deployed_commit[:12]:
+            result["status"] = "update-available"
+            result["update_needed"] = True
+            result["message"] = "A newer GitHub commit is available. Approval is required before updating."
+        else:
+            result["status"] = "up-to-date"
+            result["message"] = "No required update detected."
+
+        return result
+    except Exception:
+        result["status"] = "error"
+        result["message"] = "Update check failed due to a network/runtime issue."
+        return result
+
+
 def init_state() -> None:
     defaults = {
         "authenticated": False,
         "current_user": "",
         "pending_login_user": "",
         "needs_upload_resume_choice": False,
+        "accounts": {},
+        "pending_verifications": {},
+        "remembered_credentials_by_client": {},
+        "update_check_result": {
+            "status": "unknown",
+            "message": "Update check not run yet.",
+            "latest_commit": "",
+            "deployed_commit": "unknown",
+            "update_needed": False,
+        },
         "listing_field_errors": {},
         "buyer_reviews_by_listing": {},
         "analyzed_listings": {},
@@ -359,6 +497,9 @@ def generate_ai_suggestion_with_optional_vision(
             )
 
         views_text = ", ".join(photo_views[:max_images]) if photo_views else "unspecified"
+        safe_title = redact_sensitive_text(title)
+        safe_description = redact_sensitive_text(description)
+        safe_location = redact_sensitive_text(location)
         prompt = (
             "You are a product listing analyst. Analyze the provided product photos and listing context. "
             "Return JSON only with keys: product_name, year, condition, market_low, market_high, "
@@ -366,7 +507,7 @@ def generate_ai_suggestion_with_optional_vision(
             "Condition must be one of: Excellent, Good, Fair, Poor, Unknown. "
             "generated_description must be practical and specific for resale marketplaces. "
             "issues_to_edit should be an array of concise fixes for the lister. "
-            f"Context: title={title}; description={description}; location={location}; current_price={current_price}; "
+            f"Context: title={safe_title}; description={safe_description}; location={safe_location}; current_price={current_price}; "
             f"photo_views={views_text}."
         )
 
@@ -584,9 +725,10 @@ def render_listing_field_highlights(errors: dict[str, str]) -> None:
         st.markdown(f"<style>{''.join(css_rules)}</style>", unsafe_allow_html=True)
 
 
-def render_account_security_panel(expected_username: str, expected_password: str, logger: Any) -> None:
+def render_account_security_panel(logger: Any) -> None:
     st.sidebar.header("Account and Security")
     st.sidebar.write(f"Signed in as: **{st.session_state.current_user}**")
+    st.sidebar.caption("Privacy mode keeps sensitive personal details out of external AI prompts.")
 
     profiles = st.session_state.account_profiles
     profile = profiles.get(st.session_state.current_user, {"email": "", "phone": ""})
@@ -597,7 +739,12 @@ def render_account_security_panel(expected_username: str, expected_password: str
         save_contact = st.form_submit_button("Save recovery contacts")
 
     if save_contact:
-        profiles[st.session_state.current_user] = {"email": email.strip(), "phone": phone.strip()}
+        clean_email = email.strip()
+        clean_phone = phone.strip()
+        profiles[st.session_state.current_user] = {"email": clean_email, "phone": clean_phone}
+        if st.session_state.current_user in st.session_state.accounts:
+            st.session_state.accounts[st.session_state.current_user]["email"] = clean_email
+            st.session_state.accounts[st.session_state.current_user]["phone"] = clean_phone
         emit_audit_event(logger, "backup_contact_updated", {"user": st.session_state.current_user})
         st.sidebar.success("Recovery contacts saved.")
 
@@ -608,18 +755,18 @@ def render_account_security_panel(expected_username: str, expected_password: str
         do_change = st.form_submit_button("Change password")
 
     if do_change:
-        effective_password = get_effective_password(expected_username, expected_password)
-        if st.session_state.current_user != expected_username:
-            st.sidebar.error("Only the configured account can change password in this version.")
-        elif not authenticate_user(expected_username, current_password, expected_username, effective_password):
+        account = st.session_state.accounts.get(st.session_state.current_user)
+        if not account:
+            st.sidebar.error("Account profile not found.")
+        elif not verify_password(current_password, str(account.get("password_hash", ""))):
             st.sidebar.error("Current password is incorrect.")
         elif len(new_password.strip()) < 8:
             st.sidebar.error("New password must be at least 8 characters.")
         elif new_password != confirm_password:
             st.sidebar.error("New password and confirmation do not match.")
         else:
-            st.session_state.password_overrides[expected_username] = new_password.strip()
-            emit_audit_event(logger, "password_changed", {"user": expected_username})
+            st.session_state.accounts[st.session_state.current_user]["password_hash"] = hash_password(new_password.strip())
+            emit_audit_event(logger, "password_changed", {"user": st.session_state.current_user})
             st.sidebar.success("Password changed.")
 
     if st.sidebar.button("Log out", use_container_width=True):
@@ -649,6 +796,37 @@ def render_messages_panel(logger: Any, current_user: str) -> None:
         st.caption(f"Preferred contact: {msg['contact_preference']}")
 
 
+def render_update_assistant_panel(logger: Any) -> None:
+    st.markdown("---")
+    st.header("AI update assistant")
+    st.caption("Checks for updates and always asks for approval before any update action.")
+    st.write(f"Current app version: **{APP_VERSION}**")
+
+    if st.button("Run update check"):
+        result = check_for_available_update()
+        st.session_state.update_check_result = result
+        emit_audit_event(logger, "update_check_run", {"status": result.get("status", "unknown")})
+
+    result = st.session_state.update_check_result
+    status = str(result.get("status", "unknown"))
+    message = str(result.get("message", "Update check not run yet."))
+
+    st.write(f"Status: **{status}**")
+    st.write(message)
+
+    latest_commit = str(result.get("latest_commit", ""))
+    deployed_commit = str(result.get("deployed_commit", "unknown"))
+    if latest_commit:
+        st.caption(f"Latest GitHub main commit: {latest_commit}")
+    st.caption(f"Deployed commit (if configured): {deployed_commit}")
+
+    if bool(result.get("update_needed", False)):
+        st.warning("Update is recommended by policy. Approval is required before proceeding.")
+        if st.button("Approve update notification"):
+            emit_audit_event(logger, "update_approved", {"status": status, "latest_commit": latest_commit})
+            st.info("Update approved. Push/redeploy the latest code to apply changes.")
+
+
 def main() -> None:
     st.set_page_config(page_title="Online market listing intelligence", page_icon="🛍️")
     st.title("Online market listing intelligence")
@@ -665,56 +843,189 @@ def main() -> None:
         st.error(str(exc))
         st.stop()
 
+    bootstrap_password = get_effective_password(expected_username, expected_password)
+    ensure_default_account(expected_username, bootstrap_password)
+    st.session_state.account_profiles.setdefault(expected_username, {"email": "", "phone": ""})
+
+    try:
+        pre_auth_client_id = get_client_identity(getattr(st.context, "headers", {}))
+    except Exception:
+        pre_auth_client_id = "local"
+
     if not st.session_state.authenticated:
+        remembered = get_remembered_credentials(pre_auth_client_id)
+
         with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
+            username = st.text_input("Username", value=remembered["username"])
+            password = st.text_input("Password", type="password", value=remembered["password"])
+            remember_credentials = st.checkbox(
+                "Remember username and password on this device",
+                value=bool(remembered["username"]),
+            )
             submitted = st.form_submit_button("Log in")
 
         if submitted:
             try:
-                effective_password = get_effective_password(expected_username, expected_password)
-                if authenticate_user(username, password, expected_username, effective_password):
+                if authenticate_account(username.strip(), password):
                     st.session_state.authenticated = True
-                    st.session_state.current_user = username
-                    st.session_state.pending_login_user = username
+                    st.session_state.current_user = username.strip()
+                    st.session_state.pending_login_user = username.strip()
                     st.session_state.needs_upload_resume_choice = True
-                    load_user_listing_draft(username)
-                    emit_audit_event(logger, "login", {"status": "success", "user": username})
+                    load_user_listing_draft(username.strip())
+
+                    if remember_credentials:
+                        save_remembered_credentials(pre_auth_client_id, username.strip(), password)
+                    else:
+                        clear_remembered_credentials(pre_auth_client_id)
+
+                    emit_audit_event(logger, "login", {"status": "success", "user": username.strip()})
                     st.rerun()
-                emit_audit_event(logger, "login", {"status": "failed", "user": username})
-                st.error("Invalid username or password")
+
+                account = st.session_state.accounts.get(username.strip())
+                if account and not is_contact_verified(account):
+                    st.error("Account exists but is not verified yet. Complete verification to log in.")
+                else:
+                    st.error("Invalid username or password")
+                emit_audit_event(logger, "login", {"status": "failed", "user": username.strip()})
             except Exception as exc:
                 logger.exception("Login flow failed")
                 st.error(f"Login failed unexpectedly: {exc}")
 
+        with st.expander("Create account"):
+            with st.form("create_account_form"):
+                new_username = st.text_input("New username")
+                new_password = st.text_input("New password", type="password")
+                confirm_new_password = st.text_input("Confirm password", type="password")
+                verify_method = st.selectbox("Verification method", ["Email", "Phone"])
+                verify_value = st.text_input("Email or phone for verification")
+                create_submit = st.form_submit_button("Create account and send verification code")
+
+            if create_submit:
+                clean_username = new_username.strip()
+                clean_contact = verify_value.strip()
+
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", clean_username):
+                    st.error("Username must be 3-32 chars and only include letters, numbers, _, ., or -")
+                elif account_exists(clean_username):
+                    st.error("That username already exists.")
+                elif len(new_password.strip()) < 8:
+                    st.error("Password must be at least 8 characters.")
+                elif new_password != confirm_new_password:
+                    st.error("Passwords do not match.")
+                elif not clean_contact:
+                    st.error("Email or phone is required for verification.")
+                else:
+                    email = clean_contact if verify_method == "Email" else ""
+                    phone = clean_contact if verify_method == "Phone" else ""
+                    create_account(clean_username, new_password.strip(), email=email, phone=phone)
+                    st.session_state.account_profiles[clean_username] = {"email": email, "phone": phone}
+
+                    code = build_verification_code()
+                    st.session_state.pending_verifications[clean_username] = {
+                        "purpose": "create_account",
+                        "method": verify_method.lower(),
+                        "value": clean_contact,
+                        "code": code,
+                        "expires_at": (datetime.now(timezone.utc).timestamp() + 600),
+                    }
+                    emit_audit_event(logger, "account_created", {"user": clean_username, "method": verify_method.lower()})
+                    st.success("Account created. Enter your verification code below to activate login.")
+
+                    if get_secret_value("DEMO_SHOW_VERIFICATION_CODES").lower() != "false":
+                        st.info(f"Demo verification code for {clean_username}: {code}")
+
+            with st.form("verify_new_account_form"):
+                verify_username = st.text_input("Username to verify")
+                verify_code = st.text_input("Verification code")
+                verify_submit = st.form_submit_button("Verify account")
+
+            if verify_submit:
+                pending = st.session_state.pending_verifications.get(verify_username.strip())
+                account = st.session_state.accounts.get(verify_username.strip())
+
+                if not pending or pending.get("purpose") != "create_account":
+                    st.error("No account verification is pending for this username.")
+                elif datetime.now(timezone.utc).timestamp() > float(pending.get("expires_at", 0)):
+                    st.error("Verification code expired. Create account again to generate a new code.")
+                elif str(verify_code).strip() != str(pending.get("code", "")):
+                    st.error("Invalid verification code.")
+                elif not account:
+                    st.error("Account not found.")
+                else:
+                    if pending.get("method") == "email":
+                        account["verified_email"] = True
+                    else:
+                        account["verified_phone"] = True
+                    st.session_state.pending_verifications.pop(verify_username.strip(), None)
+                    emit_audit_event(logger, "account_verified", {"user": verify_username.strip()})
+                    st.success("Account verified. You can now log in.")
+
         with st.expander("Forgot password?"):
-            with st.form("forgot_password_form"):
+            with st.form("forgot_password_request_form"):
                 recover_username = st.text_input("Username for recovery")
                 recovery_method = st.selectbox("Recovery method", ["Email", "Phone"])
                 recovery_value = st.text_input("Recovery email or phone")
-                new_password = st.text_input("New password", type="password")
-                confirm_password = st.text_input("Confirm new password", type="password")
-                recover_submit = st.form_submit_button("Verify and reset password")
+                recovery_new_password = st.text_input("New password", type="password")
+                recovery_confirm_password = st.text_input("Confirm new password", type="password")
+                recover_submit = st.form_submit_button("Send recovery verification code")
 
             if recover_submit:
-                profile = st.session_state.account_profiles.get(recover_username, {"email": "", "phone": ""})
-                expected_value = profile.get("email", "") if recovery_method == "Email" else profile.get("phone", "")
+                account = st.session_state.accounts.get(recover_username.strip())
+                expected_value = ""
+                if account:
+                    expected_value = str(account.get("email", "")) if recovery_method == "Email" else str(account.get("phone", ""))
 
-                if recover_username != expected_username:
-                    st.error("Recovery is only available for the configured account.")
+                if not account:
+                    st.error("Account not found.")
                 elif not expected_value:
-                    st.error("No recovery contact is linked yet. Log in and add email/phone first.")
+                    st.error("No recovery contact is linked for this method.")
                 elif recovery_value.strip().lower() != expected_value.strip().lower():
                     st.error("Recovery verification failed. Contact value does not match.")
-                elif len(new_password.strip()) < 8:
+                elif len(recovery_new_password.strip()) < 8:
                     st.error("New password must be at least 8 characters.")
-                elif new_password != confirm_password:
+                elif recovery_new_password != recovery_confirm_password:
                     st.error("New password and confirmation do not match.")
                 else:
-                    st.session_state.password_overrides[expected_username] = new_password.strip()
-                    emit_audit_event(logger, "password_reset", {"user": expected_username, "method": recovery_method.lower()})
-                    st.success("Password reset successful. Use the new password to log in.")
+                    code = build_verification_code()
+                    st.session_state.pending_verifications[recover_username.strip()] = {
+                        "purpose": "reset_password",
+                        "method": recovery_method.lower(),
+                        "value": recovery_value.strip(),
+                        "code": code,
+                        "new_password_hash": hash_password(recovery_new_password.strip()),
+                        "expires_at": (datetime.now(timezone.utc).timestamp() + 600),
+                    }
+                    emit_audit_event(
+                        logger,
+                        "password_reset_requested",
+                        {"user": recover_username.strip(), "method": recovery_method.lower()},
+                    )
+                    st.success("Recovery code generated. Enter it below to complete password reset.")
+                    if get_secret_value("DEMO_SHOW_VERIFICATION_CODES").lower() != "false":
+                        st.info(f"Demo recovery code for {recover_username.strip()}: {code}")
+
+            with st.form("forgot_password_verify_form"):
+                verify_reset_username = st.text_input("Username for reset verification")
+                verify_reset_code = st.text_input("Reset verification code")
+                verify_reset_submit = st.form_submit_button("Verify and reset password")
+
+            if verify_reset_submit:
+                pending = st.session_state.pending_verifications.get(verify_reset_username.strip())
+                account = st.session_state.accounts.get(verify_reset_username.strip())
+
+                if not pending or pending.get("purpose") != "reset_password":
+                    st.error("No password reset is pending for this username.")
+                elif datetime.now(timezone.utc).timestamp() > float(pending.get("expires_at", 0)):
+                    st.error("Recovery code expired. Request a new one.")
+                elif str(verify_reset_code).strip() != str(pending.get("code", "")):
+                    st.error("Invalid recovery code.")
+                elif not account:
+                    st.error("Account not found.")
+                else:
+                    account["password_hash"] = str(pending.get("new_password_hash", account.get("password_hash", "")))
+                    st.session_state.pending_verifications.pop(verify_reset_username.strip(), None)
+                    emit_audit_event(logger, "password_reset", {"user": verify_reset_username.strip()})
+                    st.success("Password reset successful. Use your new password to log in.")
         st.stop()
 
     try:
@@ -728,7 +1039,8 @@ def main() -> None:
         st.error(f"Request setup failed unexpectedly: {exc}")
         st.stop()
 
-    render_account_security_panel(expected_username=expected_username, expected_password=expected_password, logger=logger)
+    render_account_security_panel(logger=logger)
+    render_update_assistant_panel(logger=logger)
 
     role = st.radio("Select your role", ["Lister", "Buyer"], horizontal=True)
 
