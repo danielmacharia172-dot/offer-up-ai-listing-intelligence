@@ -1,7 +1,10 @@
+import re
+from datetime import datetime, timezone
+from typing import Any
+
+import requests
 import streamlit as st
 from PIL import Image
-from typing import Any
-from datetime import datetime, timezone
 
 from app.logging_config import configure_logging, emit_audit_event
 from app.pipelines.fraud_detector import detect_fraud_signals
@@ -21,7 +24,25 @@ from app.security import (
 )
 
 
-def analyze_uploaded_photo(uploaded_photo: Any) -> dict[str, Any]:
+def init_state() -> None:
+    defaults = {
+        "authenticated": False,
+        "current_user": "",
+        "listing_field_errors": {},
+        "buyer_reviews_by_listing": {},
+        "analyzed_listings": {},
+        "last_listing_key": None,
+        "account_profiles": {},
+        "password_overrides": {},
+        "messages": [],
+        "detected_location": "",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def analyze_uploaded_photo(uploaded_photo: Any, view_label: str) -> dict[str, Any]:
     uploaded_photo.seek(0)
     image = Image.open(uploaded_photo)
     width, height = image.size
@@ -35,25 +56,147 @@ def analyze_uploaded_photo(uploaded_photo: Any) -> dict[str, Any]:
         "format": image.format or "unknown",
         "mode": image.mode,
         "file_size_kb": file_size_kb,
+        "view": view_label,
     }
 
 
-def build_listing_key(title: str, location: str) -> str:
-    return f"{title.strip().lower()}|{location.strip().lower()}"
+def build_listing_key(title: str, location: str, owner: str) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    safe_title = re.sub(r"\s+", "-", title.strip().lower())
+    safe_location = re.sub(r"\s+", "-", location.strip().lower())
+    safe_owner = re.sub(r"\s+", "-", owner.strip().lower())
+    return f"{safe_title}|{safe_location}|{safe_owner}|{stamp}"
 
 
 def listing_label(title: str, location: str) -> str:
     return f"{title} ({location})"
 
 
-def render_reviews_section(logger: Any, client_id: str) -> None:
-    if "buyer_reviews_by_listing" not in st.session_state:
-        st.session_state.buyer_reviews_by_listing = {}
-    if "analyzed_listings" not in st.session_state:
-        st.session_state.analyzed_listings = {}
-    if "last_listing_key" not in st.session_state:
-        st.session_state.last_listing_key = None
+def get_effective_password(username: str, default_password: str) -> str:
+    override = st.session_state.password_overrides.get(username)
+    return override if override else default_password
 
+
+def infer_condition(description: str, photo_insights: list[dict[str, Any]]) -> str:
+    text = description.lower()
+    if any(term in text for term in ["new", "sealed", "unused", "mint"]):
+        return "Excellent"
+    if any(term in text for term in ["good", "works", "clean", "lightly used"]):
+        return "Good"
+    if any(term in text for term in ["fair", "scratch", "wear", "older"]):
+        return "Fair"
+
+    avg_mp = 0.0
+    if photo_insights:
+        avg_mp = sum(item["megapixels"] for item in photo_insights) / len(photo_insights)
+
+    if avg_mp >= 4:
+        return "Good"
+    if avg_mp >= 1.5:
+        return "Fair"
+    return "Unknown"
+
+
+def extract_year(text: str) -> str:
+    match = re.search(r"\b(19\d{2}|20\d{2})\b", text)
+    return match.group(1) if match else "Unknown"
+
+
+def estimate_market_range(title: str, condition: str) -> tuple[int, int]:
+    text = title.lower()
+    baseline = 200
+
+    category_prices = {
+        "iphone": 550,
+        "samsung": 420,
+        "macbook": 900,
+        "laptop": 650,
+        "playstation": 360,
+        "xbox": 320,
+        "sofa": 500,
+        "couch": 520,
+        "bike": 300,
+        "camera": 450,
+        "watch": 250,
+    }
+
+    for keyword, value in category_prices.items():
+        if keyword in text:
+            baseline = value
+            break
+
+    multipliers = {
+        "Excellent": 1.0,
+        "Good": 0.85,
+        "Fair": 0.65,
+        "Unknown": 0.75,
+    }
+    adjusted = baseline * multipliers.get(condition, 0.75)
+    low = int(round(adjusted * 0.9))
+    high = int(round(adjusted * 1.15))
+    return low, high
+
+
+def generate_ai_suggestion(
+    title: str,
+    description: str,
+    location: str,
+    current_price: float,
+    photo_insights: list[dict[str, Any]],
+    pipeline_price: int,
+) -> dict[str, Any]:
+    year = extract_year(f"{title} {description}")
+    condition = infer_condition(description, photo_insights)
+    market_low, market_high = estimate_market_range(title, condition)
+
+    blended_suggested = int(round((pipeline_price + ((market_low + market_high) / 2)) / 2))
+    product_name = title.strip().title() if title.strip() else "Unknown product"
+
+    description_lines = [
+        f"Product name: {product_name}",
+        f"Estimated production year: {year}",
+        f"Condition assessment: {condition}",
+        f"Location context: {location}",
+    ]
+
+    if photo_insights:
+        view_summary = ", ".join(item["view"] for item in photo_insights)
+        description_lines.append(f"Photo coverage: {view_summary}")
+
+    description_lines.append(
+        f"Suggested market price range: ${market_low} - ${market_high}; recommended list price: ${blended_suggested}."
+    )
+
+    return {
+        "product_name": product_name,
+        "year": year,
+        "condition": condition,
+        "market_low": market_low,
+        "market_high": market_high,
+        "suggested_price": blended_suggested,
+        "generated_description": "\n".join(description_lines),
+    }
+
+
+def suggest_location_from_ip(client_id: str) -> str:
+    if not client_id or client_id == "local":
+        return ""
+
+    try:
+        response = requests.get(f"https://ipapi.co/{client_id}/json/", timeout=4)
+        if response.status_code != 200:
+            return ""
+        payload = response.json()
+        city = str(payload.get("city", "")).strip()
+        region = str(payload.get("region", "")).strip()
+        country = str(payload.get("country_name", "")).strip()
+        parts = [part for part in [city, region, country] if part]
+        return ", ".join(parts)
+    except Exception:
+        return ""
+
+
+def render_reviews_section(logger: Any, client_id: str) -> None:
     reviews_by_listing = st.session_state.buyer_reviews_by_listing
     listings = st.session_state.analyzed_listings
 
@@ -85,8 +228,8 @@ def render_reviews_section(logger: Any, client_id: str) -> None:
         for item in listing_options:
             if item["label"] == selected_label:
                 selected_listing_key = item["key"]
-                selected_listing_title = listings[item["key"]]["title"]
-                selected_listing_location = listings[item["key"]]["location"]
+                selected_listing_title = str(listings[item["key"]]["title"])
+                selected_listing_location = str(listings[item["key"]]["location"])
                 break
     else:
         st.info("Analyze a listing first, then buyers can post reviews for that listing.")
@@ -213,10 +356,75 @@ def render_listing_field_highlights(errors: dict[str, str]) -> None:
         st.markdown(f"<style>{''.join(css_rules)}</style>", unsafe_allow_html=True)
 
 
+def render_account_security_panel(expected_username: str, expected_password: str, logger: Any) -> None:
+    st.sidebar.header("Account and Security")
+    st.sidebar.write(f"Signed in as: **{st.session_state.current_user}**")
+
+    profiles = st.session_state.account_profiles
+    profile = profiles.get(st.session_state.current_user, {"email": "", "phone": ""})
+
+    with st.sidebar.form("link_contact_form"):
+        email = st.text_input("Linked email", value=profile.get("email", ""), placeholder="name@example.com")
+        phone = st.text_input("Linked phone", value=profile.get("phone", ""), placeholder="+1 555 123 4567")
+        save_contact = st.form_submit_button("Save recovery contacts")
+
+    if save_contact:
+        profiles[st.session_state.current_user] = {"email": email.strip(), "phone": phone.strip()}
+        emit_audit_event(logger, "backup_contact_updated", {"user": st.session_state.current_user})
+        st.sidebar.success("Recovery contacts saved.")
+
+    with st.sidebar.form("change_password_form"):
+        current_password = st.text_input("Current password", type="password")
+        new_password = st.text_input("New password", type="password")
+        confirm_password = st.text_input("Confirm new password", type="password")
+        do_change = st.form_submit_button("Change password")
+
+    if do_change:
+        effective_password = get_effective_password(expected_username, expected_password)
+        if st.session_state.current_user != expected_username:
+            st.sidebar.error("Only the configured account can change password in this version.")
+        elif not authenticate_user(expected_username, current_password, expected_username, effective_password):
+            st.sidebar.error("Current password is incorrect.")
+        elif len(new_password.strip()) < 8:
+            st.sidebar.error("New password must be at least 8 characters.")
+        elif new_password != confirm_password:
+            st.sidebar.error("New password and confirmation do not match.")
+        else:
+            st.session_state.password_overrides[expected_username] = new_password.strip()
+            emit_audit_event(logger, "password_changed", {"user": expected_username})
+            st.sidebar.success("Password changed.")
+
+    if st.sidebar.button("Log out", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.current_user = ""
+        st.rerun()
+
+
+def render_messages_panel(logger: Any, current_user: str) -> None:
+    messages = st.session_state.messages
+    relevant = [m for m in messages if m["buyer"] == current_user or m["lister"] == current_user]
+
+    st.markdown("---")
+    st.header("Messages")
+    if not relevant:
+        st.info("No messages yet.")
+        return
+
+    for msg in reversed(relevant[-30:]):
+        st.write(
+            f"**{msg['timestamp']}** | Listing: {msg['listing_title']} | "
+            f"Buyer: {msg['buyer']} | Lister: {msg['lister']}"
+        )
+        st.write(f"Message: {msg['message']}")
+        st.caption(f"Preferred contact: {msg['contact_preference']}")
+
+
 def main() -> None:
     st.set_page_config(page_title="Online market listing intelligence", page_icon="🛍️")
     st.title("Online market listing intelligence")
     st.caption("Improve listing quality, detect fraud, recommend prices, and compute a trust score.")
+
+    init_state()
 
     logger = configure_logging()
     rate_limiter = RateLimiter(max_requests=10, window_seconds=60)
@@ -227,9 +435,6 @@ def main() -> None:
         st.error(str(exc))
         st.stop()
 
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-
     if not st.session_state.authenticated:
         with st.form("login_form"):
             username = st.text_input("Username")
@@ -238,8 +443,10 @@ def main() -> None:
 
         if submitted:
             try:
-                if authenticate_user(username, password, expected_username, expected_password):
+                effective_password = get_effective_password(expected_username, expected_password)
+                if authenticate_user(username, password, expected_username, effective_password):
                     st.session_state.authenticated = True
+                    st.session_state.current_user = username
                     emit_audit_event(logger, "login", {"status": "success", "user": username})
                     st.rerun()
                 emit_audit_event(logger, "login", {"status": "failed", "user": username})
@@ -247,6 +454,34 @@ def main() -> None:
             except Exception as exc:
                 logger.exception("Login flow failed")
                 st.error(f"Login failed unexpectedly: {exc}")
+
+        with st.expander("Forgot password?"):
+            with st.form("forgot_password_form"):
+                recover_username = st.text_input("Username for recovery")
+                recovery_method = st.selectbox("Recovery method", ["Email", "Phone"])
+                recovery_value = st.text_input("Recovery email or phone")
+                new_password = st.text_input("New password", type="password")
+                confirm_password = st.text_input("Confirm new password", type="password")
+                recover_submit = st.form_submit_button("Verify and reset password")
+
+            if recover_submit:
+                profile = st.session_state.account_profiles.get(recover_username, {"email": "", "phone": ""})
+                expected_value = profile.get("email", "") if recovery_method == "Email" else profile.get("phone", "")
+
+                if recover_username != expected_username:
+                    st.error("Recovery is only available for the configured account.")
+                elif not expected_value:
+                    st.error("No recovery contact is linked yet. Log in and add email/phone first.")
+                elif recovery_value.strip().lower() != expected_value.strip().lower():
+                    st.error("Recovery verification failed. Contact value does not match.")
+                elif len(new_password.strip()) < 8:
+                    st.error("New password must be at least 8 characters.")
+                elif new_password != confirm_password:
+                    st.error("New password and confirmation do not match.")
+                else:
+                    st.session_state.password_overrides[expected_username] = new_password.strip()
+                    emit_audit_event(logger, "password_reset", {"user": expected_username, "method": recovery_method.lower()})
+                    st.success("Password reset successful. Use the new password to log in.")
         st.stop()
 
     try:
@@ -260,13 +495,89 @@ def main() -> None:
         st.error(f"Request setup failed unexpectedly: {exc}")
         st.stop()
 
-    if "listing_field_errors" not in st.session_state:
-        st.session_state.listing_field_errors = {}
+    render_account_security_panel(expected_username=expected_username, expected_password=expected_password, logger=logger)
+
+    role = st.radio("Select your role", ["Lister", "Buyer"], horizontal=True)
+
+    if role == "Buyer":
+        listings = st.session_state.analyzed_listings
+        st.header("Marketplace")
+        if not listings:
+            st.info("No listings available yet. Ask a lister to publish a listing first.")
+        else:
+            for key, item in reversed(list(listings.items())):
+                with st.container(border=True):
+                    st.subheader(f"{item['title']} - ${item['ai']['suggested_price']}")
+                    st.caption(f"Location: {item['location']} | Listed by: {item['lister']}")
+                    st.write(item["ai"]["generated_description"])
+                    st.write(f"Condition: {item['ai']['condition']} | Year: {item['ai']['year']}")
+
+                    with st.form(f"interest_form_{key}"):
+                        message = st.text_area("Message to lister", placeholder="Hi, I am interested. Is this still available?")
+                        contact_preference = st.selectbox("Preferred contact", ["In-platform messages", "Email", "Phone"])
+                        send_interest = st.form_submit_button("I'm interested")
+
+                    if send_interest:
+                        clean_message = message.strip()
+                        if not clean_message:
+                            st.error("Please enter a message before sending.")
+                        else:
+                            st.session_state.messages.append(
+                                {
+                                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                                    "listing_key": key,
+                                    "listing_title": item["title"],
+                                    "buyer": st.session_state.current_user,
+                                    "lister": item["lister"],
+                                    "message": clean_message,
+                                    "contact_preference": contact_preference,
+                                }
+                            )
+                            emit_audit_event(
+                                logger,
+                                "buyer_interest_sent",
+                                {
+                                    "listing_key": key,
+                                    "buyer": st.session_state.current_user,
+                                    "lister": item["lister"],
+                                },
+                            )
+                            st.success("Interest message sent to lister.")
+
+        render_messages_panel(logger=logger, current_user=st.session_state.current_user)
+        render_reviews_section(logger=logger, client_id=client_id)
+        return
 
     listing_field_errors: dict[str, str] = st.session_state.listing_field_errors
     render_listing_field_highlights(listing_field_errors)
 
+    use_location_detect = st.checkbox("Allow location suggestion from my connection (permission-based)")
+    if st.button("Suggest my current location", disabled=not use_location_detect):
+        detected = suggest_location_from_ip(client_id)
+        if detected:
+            st.session_state.detected_location = detected
+            st.success(f"Suggested location: {detected}")
+        else:
+            st.warning("Could not determine your location automatically. Enter location manually.")
+
+    default_location = st.session_state.detected_location if st.session_state.detected_location else "Austin, TX"
+
     with st.form("listing_form"):
+        uploaded_photos = st.file_uploader(
+            "Listing photos (upload front, back, and sideways views)",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+        )
+
+        photo_views: list[str] = []
+        for idx, uploaded_photo in enumerate(uploaded_photos or []):
+            view_label = st.selectbox(
+                f"Photo view for {uploaded_photo.name}",
+                ["Front side", "Back side", "Sideways", "Other"],
+                key=f"photo_view_{idx}_{uploaded_photo.name}",
+            )
+            photo_views.append(view_label)
+
         title = st.text_input("Listing title", placeholder="Used iPhone 13 Pro Max")
         if "title" in listing_field_errors:
             st.error(listing_field_errors["title"])
@@ -279,15 +590,10 @@ def main() -> None:
         if "price" in listing_field_errors:
             st.error(listing_field_errors["price"])
 
-        location = st.text_input("Location", placeholder="Austin, TX")
+        location = st.text_input("Location", value=default_location, placeholder="Austin, TX")
         if "location" in listing_field_errors:
             st.error(listing_field_errors["location"])
 
-        uploaded_photos = st.file_uploader(
-            "Listing photos (optional)",
-            type=["png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=True,
-        )
         submitted = st.form_submit_button("Analyze listing")
 
     if submitted:
@@ -312,7 +618,19 @@ def main() -> None:
             fraud = detect_fraud_signals(title=title, description=description, price=price, location=location)
             price_recommendation = recommend_price(title=title, description=description, price=price, location=location)
             trust = compute_trust_score(title=title, description=description, price=price, location=location)
-            photo_insights = [analyze_uploaded_photo(photo) for photo in (uploaded_photos or [])]
+            photo_insights = []
+            for idx, photo in enumerate(uploaded_photos or []):
+                view_label = photo_views[idx] if idx < len(photo_views) else "Other"
+                photo_insights.append(analyze_uploaded_photo(photo, view_label))
+
+            ai_suggestion = generate_ai_suggestion(
+                title=title,
+                description=description,
+                location=location,
+                current_price=float(price),
+                photo_insights=photo_insights,
+                pipeline_price=price_recommendation["suggested_price"],
+            )
             st.session_state.listing_field_errors = {}
         except ValueError as exc:
             emit_audit_event(logger, "validation_failed", {"client": client_id, "error": str(exc)})
@@ -326,10 +644,17 @@ def main() -> None:
 
         emit_audit_event(logger, "listing_analyzed", {"client": client_id, "score": quality["score"]})
 
-        current_listing_key = build_listing_key(title, location)
+        current_listing_key = build_listing_key(title, location, st.session_state.current_user)
+        profile = st.session_state.account_profiles.get(st.session_state.current_user, {"email": "", "phone": ""})
         st.session_state.analyzed_listings[current_listing_key] = {
             "title": title,
             "location": location,
+            "description": description,
+            "price": float(price),
+            "lister": st.session_state.current_user,
+            "contact_email": profile.get("email", ""),
+            "contact_phone": profile.get("phone", ""),
+            "ai": ai_suggestion,
         }
         st.session_state.last_listing_key = current_listing_key
 
@@ -338,7 +663,7 @@ def main() -> None:
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Quality score", f"{quality['score']}/100")
         col2.metric("Fraud risk", f"{fraud['risk_score']}/100")
-        col3.metric("Suggested price", f"${price_recommendation['suggested_price']}")
+        col3.metric("Suggested price", f"${ai_suggestion['suggested_price']}")
         col4.metric("Trust score", f"{trust['trust_score']}/100")
 
         st.markdown("### Quality insights")
@@ -351,6 +676,16 @@ def main() -> None:
 
         st.markdown("### Price rationale")
         st.write(price_recommendation["rationale"])
+
+        st.markdown("### AI-assisted product summary")
+        st.write(f"Product name: **{ai_suggestion['product_name']}**")
+        st.write(f"Estimated production year: **{ai_suggestion['year']}**")
+        st.write(f"Condition assessment: **{ai_suggestion['condition']}**")
+        st.write(
+            f"Market value range: **${ai_suggestion['market_low']} - ${ai_suggestion['market_high']}** "
+            f"(recommended list price: **${ai_suggestion['suggested_price']}**)"
+        )
+        st.text_area("Generated detailed description", value=ai_suggestion["generated_description"], height=180)
 
         st.markdown("### Listing photos")
         if not uploaded_photos:
@@ -367,10 +702,11 @@ def main() -> None:
                     with cols[idx]:
                         st.image(uploaded_photo, caption=f"Photo {start + idx + 1}", use_container_width=True)
                         st.caption(
-                            f"{insight['format']} | {insight['width']}x{insight['height']} | "
+                            f"{insight['view']} | {insight['format']} | {insight['width']}x{insight['height']} | "
                             f"{insight['megapixels']} MP | {insight['file_size_kb']} KB"
                         )
 
+    render_messages_panel(logger=logger, current_user=st.session_state.current_user)
     render_reviews_section(logger=logger, client_id=client_id)
 
 
