@@ -591,6 +591,7 @@ def init_state() -> None:
         "needs_upload_resume_choice": False,
         "auth_page": "Login",
         "just_created_username": "",
+        "just_created_password": "",
         "accounts": {},
         "pending_verifications": {},
         "remembered_credentials_by_client": {},
@@ -1527,9 +1528,10 @@ def main() -> None:
 
         if active_auth_page == "Login":
             login_prefill = st.session_state.just_created_username or remembered["username"]
+            password_prefill = st.session_state.just_created_password or remembered["password"]
             with st.form("login_form"):
                 username = st.text_input("Username", value=login_prefill)
-                password = st.text_input("Password", type="password", value=remembered["password"])
+                password = st.text_input("Password", type="password", value=password_prefill)
                 remember_credentials = st.checkbox(
                     "Remember username and password on this device",
                     value=bool(remembered["username"]),
@@ -1542,6 +1544,7 @@ def main() -> None:
                         st.session_state.authenticated = True
                         st.session_state.current_user = username.strip()
                         st.session_state.just_created_username = ""
+                        st.session_state.just_created_password = ""
                         ensure_account_programs(username.strip())
                         st.session_state.pending_login_user = username.strip()
                         st.session_state.needs_upload_resume_choice = True
@@ -1590,6 +1593,7 @@ def main() -> None:
                     st.session_state.account_profiles[clean_username] = {"email": clean_email, "phone": clean_phone}
                     st.session_state.user_roles[clean_username] = "Lister"
                     st.session_state.just_created_username = clean_username
+                    st.session_state.just_created_password = new_password.strip()
                     st.session_state.auth_page = "Login"
                     emit_audit_event(logger, "account_created", {"user": clean_username})
                     st.success("Account created successfully. Redirecting to Login.")
