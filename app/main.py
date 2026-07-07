@@ -1385,6 +1385,7 @@ def render_profile_panel(logger: Any) -> None:
                     st.success("Transaction outcome saved.")
 
     if st.session_state.current_user == st.session_state.get("admin_username", ""):
+        st.markdown("#### Admin tools")
         with st.expander("Vision diagnostics"):
             diag = get_vision_diagnostics()
             st.caption("Configuration checks only. Secret values are never shown.")
