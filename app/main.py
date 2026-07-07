@@ -568,6 +568,8 @@ def init_state() -> None:
         "user_roles": {},
         "pending_login_user": "",
         "needs_upload_resume_choice": False,
+        "auth_page": "Login",
+        "just_created_username": "",
         "accounts": {},
         "pending_verifications": {},
         "remembered_credentials_by_client": {},
@@ -1509,43 +1511,55 @@ def main() -> None:
 
     if not st.session_state.authenticated:
         remembered = get_remembered_credentials(pre_auth_client_id)
+        auth_pages = ["Login", "Create account", "Forgot password"]
+        active_auth_page = st.session_state.auth_page if st.session_state.auth_page in auth_pages else "Login"
+        active_auth_page = st.radio(
+            "Account page",
+            options=auth_pages,
+            index=auth_pages.index(active_auth_page),
+            horizontal=True,
+        )
+        st.session_state.auth_page = active_auth_page
 
-        with st.form("login_form"):
-            username = st.text_input("Username", value=remembered["username"])
-            password = st.text_input("Password", type="password", value=remembered["password"])
-            remember_credentials = st.checkbox(
-                "Remember username and password on this device",
-                value=bool(remembered["username"]),
-            )
-            submitted = st.form_submit_button("Log in")
+        if active_auth_page == "Login":
+            login_prefill = st.session_state.just_created_username or remembered["username"]
+            with st.form("login_form"):
+                username = st.text_input("Username", value=login_prefill)
+                password = st.text_input("Password", type="password", value=remembered["password"])
+                remember_credentials = st.checkbox(
+                    "Remember username and password on this device",
+                    value=bool(remembered["username"]),
+                )
+                submitted = st.form_submit_button("Log in")
 
-        if submitted:
-            try:
-                if authenticate_account(username.strip(), password):
-                    st.session_state.authenticated = True
-                    st.session_state.current_user = username.strip()
-                    ensure_account_programs(username.strip())
-                    st.session_state.pending_login_user = username.strip()
-                    st.session_state.needs_upload_resume_choice = True
-                    st.session_state.active_role = st.session_state.user_roles.get(username.strip(), "Lister")
-                    st.session_state.active_panel = "profile"
-                    load_user_listing_draft(username.strip())
+            if submitted:
+                try:
+                    if authenticate_account(username.strip(), password):
+                        st.session_state.authenticated = True
+                        st.session_state.current_user = username.strip()
+                        st.session_state.just_created_username = ""
+                        ensure_account_programs(username.strip())
+                        st.session_state.pending_login_user = username.strip()
+                        st.session_state.needs_upload_resume_choice = True
+                        st.session_state.active_role = st.session_state.user_roles.get(username.strip(), "Lister")
+                        st.session_state.active_panel = "profile"
+                        load_user_listing_draft(username.strip())
 
-                    if remember_credentials:
-                        save_remembered_credentials(pre_auth_client_id, username.strip(), password)
-                    else:
-                        clear_remembered_credentials(pre_auth_client_id)
+                        if remember_credentials:
+                            save_remembered_credentials(pre_auth_client_id, username.strip(), password)
+                        else:
+                            clear_remembered_credentials(pre_auth_client_id)
 
-                    emit_audit_event(logger, "login", {"status": "success", "user": username.strip()})
-                    st.rerun()
+                        emit_audit_event(logger, "login", {"status": "success", "user": username.strip()})
+                        st.rerun()
 
-                st.error("Invalid username or password")
-                emit_audit_event(logger, "login", {"status": "failed", "user": username.strip()})
-            except Exception as exc:
-                logger.exception("Login flow failed")
-                st.error(f"Login failed unexpectedly: {exc}")
+                    st.error("Invalid username or password")
+                    emit_audit_event(logger, "login", {"status": "failed", "user": username.strip()})
+                except Exception as exc:
+                    logger.exception("Login flow failed")
+                    st.error(f"Login failed unexpectedly: {exc}")
 
-        with st.expander("Create account"):
+        if active_auth_page == "Create account":
             with st.form("create_account_form"):
                 new_username = st.text_input("New username")
                 new_password = st.text_input("New password", type="password")
@@ -1571,10 +1585,13 @@ def main() -> None:
                     create_account(clean_username, new_password.strip(), email=clean_email, phone=clean_phone)
                     st.session_state.account_profiles[clean_username] = {"email": clean_email, "phone": clean_phone}
                     st.session_state.user_roles[clean_username] = "Lister"
+                    st.session_state.just_created_username = clean_username
+                    st.session_state.auth_page = "Login"
                     emit_audit_event(logger, "account_created", {"user": clean_username})
-                    st.success("Account created successfully. You can log in now.")
+                    st.success("Account created successfully. Redirecting to Login.")
+                    st.rerun()
 
-        with st.expander("Forgot password?"):
+        if active_auth_page == "Forgot password":
             with st.form("forgot_password_request_form"):
                 recover_username = st.text_input("Username for recovery")
                 recovery_method = st.selectbox("Recovery method", ["Email", "Phone"])
