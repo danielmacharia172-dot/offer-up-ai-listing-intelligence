@@ -235,7 +235,9 @@ def save_auth_store(username: str | None = None) -> None:
     except Exception:
         pass
 
-    save_json_to_github("data/auth_store.json", store)
+    sync_ok = save_json_to_github("data/auth_store.json", store)
+    st.session_state["last_auth_sync_ok"] = bool(sync_ok)
+    st.session_state["last_sync_at"] = now_utc_iso()
 
 
 def save_marketplace_store(*sections: str) -> None:
@@ -277,7 +279,9 @@ def save_marketplace_store(*sections: str) -> None:
     except Exception:
         pass
 
-    save_json_to_github("data/marketplace_store.json", store)
+    sync_ok = save_json_to_github("data/marketplace_store.json", store)
+    st.session_state["last_marketplace_sync_ok"] = bool(sync_ok)
+    st.session_state["last_sync_at"] = now_utc_iso()
 
 
 def reload_marketplace_store_into_session() -> None:
@@ -341,6 +345,20 @@ def get_auth_store_diagnostics() -> dict[str, Any]:
         "roles_count": len(roles) if isinstance(roles, dict) else 0,
         "current_session_accounts": len(st.session_state.accounts),
         "current_session_user": st.session_state.current_user,
+    }
+
+
+def get_state_sync_diagnostics() -> dict[str, Any]:
+    token_present = bool(get_state_github_token().strip())
+    repo = get_state_repo().strip()
+    branch = get_state_branch().strip() or "main"
+    return {
+        "token_present": token_present,
+        "repo": repo,
+        "branch": branch,
+        "last_auth_sync_ok": st.session_state.get("last_auth_sync_ok"),
+        "last_marketplace_sync_ok": st.session_state.get("last_marketplace_sync_ok"),
+        "last_sync_at": str(st.session_state.get("last_sync_at", "")),
     }
 
 
@@ -917,6 +935,9 @@ def init_state() -> None:
         "accounts": persisted.get("accounts", {}),
         "pending_verifications": {},
         "remembered_credentials_by_client": {},
+        "last_auth_sync_ok": None,
+        "last_marketplace_sync_ok": None,
+        "last_sync_at": "",
         "rate_limiter": None,
         "update_check_result": {
             "status": "unknown",
@@ -1687,6 +1708,7 @@ def render_profile_panel(logger: Any) -> None:
 
         with st.expander("Account store diagnostics"):
             store_diag = get_auth_store_diagnostics()
+            sync_diag = get_state_sync_diagnostics()
             st.caption("Shared account persistence check for multi-user login.")
             s1, s2, s3 = st.columns(3)
             s1.metric("Accounts on disk", str(store_diag.get("accounts_count", 0)))
@@ -1697,6 +1719,15 @@ def render_profile_panel(logger: Any) -> None:
             st.write(f"Store path: **{store_diag.get('path', '')}**")
             st.write(f"Last modified: **{store_diag.get('last_modified', '') or 'Unknown'}**")
             st.write(f"Accounts visible in this session: **{store_diag.get('current_session_accounts', 0)}**")
+            st.markdown("##### GitHub sync status")
+            st.write(f"Token detected: **{'Yes' if sync_diag.get('token_present') else 'No'}**")
+            st.write(f"State repo: **{sync_diag.get('repo', '') or 'Not set'}**")
+            st.write(f"State branch: **{sync_diag.get('branch', '') or 'main'}**")
+            auth_sync = sync_diag.get('last_auth_sync_ok')
+            market_sync = sync_diag.get('last_marketplace_sync_ok')
+            st.write(f"Last auth sync ok: **{auth_sync if auth_sync is not None else 'No sync yet'}**")
+            st.write(f"Last marketplace sync ok: **{market_sync if market_sync is not None else 'No sync yet'}**")
+            st.write(f"Last sync attempt at: **{sync_diag.get('last_sync_at', '') or 'Unknown'}**")
 
             if st.button("Reload shared account store", key="reload_auth_store_btn"):
                 reload_auth_store_into_session()
